@@ -1,0 +1,245 @@
+import { ipcMain, dialog, shell, app } from 'electron'
+import { SettingsStore } from '../services/storage/settings-store'
+import { SecureSecrets } from '../services/storage/secure-secrets'
+import { LlmProviderFactory } from '../services/llm/llm-provider'
+import { resetLlmCircuit } from '../services/llm/llm-fetch'
+import { PexelsClient } from '../services/pexels/pexels-client'
+import { PixabayClient } from '../services/pexels/pixabay-client'
+import { buildPixabayPhotoSearchUrl } from '../services/pexels/pixabay-mapping'
+import { z } from 'zod'
+
+const SettingsUpdateSchema = z.object({
+  llmProvider: z.enum(['openai', 'openrouter', 'gemini', 'custom']).optional(),
+  modelId: z.string().optional(),
+  customBaseUrl: z.string().max(2048).optional(),
+  stockProvider: z.enum(['pexels', 'pixabay']).optional(),
+  downloadFolder: z.string().optional(),
+  maxConcurrentDownloads: z.number().min(1).max(10).optional(),
+  maxAgentIterations: z.number().min(5).max(200).optional(),
+  requestTimeoutSeconds: z.number().min(10).max(600).optional(),
+  requestsPerMinute: z.number().min(0).max(300).optional(),
+  skipExplicitQueries: z.boolean().optional(),
+  requireApprovalBeforeDownload: z.boolean().optional(),
+  avoidPeopleAndFaces: z.boolean().optional(),
+  isOnboarded: z.boolean().optional(),
+  theme: z.enum(['flat-black', 'flat-white']).optional(),
+  hideEstimatedCost: z.boolean().optional(),
+  // Keys are sent in the update payload but stored securely in Keychain, not in settings.json
+  openaiKey: z.string().optional(),
+  geminiKey: z.string().optional(),
+  openrouterKey: z.string().optional(),
+  customKey: z.string().optional(),
+  pexelsKey: z.string().optional(),
+  pixabayKey: z.string().optional()
+})
+
+const ProviderTestRequestSchema = z.object({
+  provider: z.enum(['openai', 'openrouter', 'gemini', 'custom']),
+  apiKey: z.string(),
+  modelId: z.string(),
+  // Custom provider only; falls back to the saved base URL when omitted.
+  baseUrl: z.string().max(2048).optional()
+})
+
+const PexelsKeySchema = z.string().max(512).optional()
+
+const MASKED_SECRET = '••••••••••••••••'
+
+function isMaskedSecret(value: string): boolean {
+  return value === MASKED_SECRET
+}
+
+async function getPublicSettingsWithSecretStatus(): Promise<Record<string, unknown>> {
+  const settings = await SettingsStore.getSettings()
+
+  const openaiKey = await SecureSecrets.hasSecret('openaiKey')
+  const geminiKey = await SecureSecrets.hasSecret('geminiKey')
+  const openrouterKey = await SecureSecrets.hasSecret('openrouterKey')
+  const customKey = await SecureSecrets.hasSecret('customKey')
+  const pexelsKey = await SecureSecrets.hasSecret('pexelsKey')
+  const pixabayKey = await SecureSecrets.hasSecret('pixabayKey')
+
+  return {
+    ...settings,
+    openaiKey: openaiKey ? MASKED_SECRET : '',
+    geminiKey: geminiKey ? MASKED_SECRET : '',
+    openrouterKey: openrouterKey ? MASKED_SECRET : '',
+    customKey: customKey ? MASKED_SECRET : '',
+    pexelsKey: pexelsKey ? MASKED_SECRET : '',
+    pixabayKey: pixabayKey ? MASKED_SECRET : ''
+  }
+}
+
+export function registerSettingsHandlers(): void {
+  ipcMain.handle('settings:getPublicSettings', async () => {
+    return await getPublicSettingsWithSecretStatus()
+  })
+
+  ipcMain.handle('settings:updateSettings', async (_, rawInput) => {
+    const input = SettingsUpdateSchema.parse(rawInput)
+
+    // Only write secrets when a real (non-empty, non-masked) value is provided.
+    // Blank/whitespace means "leave unchanged" — never overwrite or delete a stored key.
+    const applySecret = async (
+      key: 'openaiKey' | 'geminiKey' | 'openrouterKey' | 'customKey' | 'pexelsKey' | 'pixabayKey',
+      value: string | undefined
+    ): Promise<void> => {
+      if (value === undefined || isMaskedSecret(value)) return
+      const trimmed = value.trim()
+      if (!trimmed) return
+      await SecureSecrets.setSecret(key, trimmed)
+    }
+
+    await applySecret('openaiKey', input.openaiKey)
+    await applySecret('geminiKey', input.geminiKey)
+    await applySecret('openrouterKey', input.openrouterKey)
+    await applySecret('customKey', input.customKey)
+    await applySecret('pexelsKey', input.pexelsKey)
+    await applySecret('pixabayKey', input.pixabayKey)
+
+    const publicSettings = Object.fromEntries(
+      Object.entries({
+        llmProvider: input.llmProvider,
+        modelId: input.modelId?.trim(),
+        customBaseUrl: input.customBaseUrl?.trim(),
+        stockProvider: input.stockProvider,
+        downloadFolder: input.downloadFolder,
+        maxConcurrentDownloads: input.maxConcurrentDownloads,
+        maxAgentIterations: input.maxAgentIterations,
+        requestTimeoutSeconds: input.requestTimeoutSeconds,
+        requestsPerMinute: input.requestsPerMinute,
+        skipExplicitQueries: input.skipExplicitQueries,
+        requireApprovalBeforeDownload: input.requireApprovalBeforeDownload,
+        avoidPeopleAndFaces: input.avoidPeopleAndFaces,
+        isOnboarded: input.isOnboarded,
+        theme: input.theme,
+        hideEstimatedCost: input.hideEstimatedCost
+      }).filter(([, value]) => value !== undefined)
+    )
+    await SettingsStore.updateSettings(publicSettings)
+    return await getPublicSettingsWithSecretStatus()
+  })
+
+  ipcMain.handle('settings:testProvider', async (_, rawInput) => {
+    const providerRequest = ProviderTestRequestSchema.parse(rawInput)
+    const { provider, modelId } = providerRequest
+    let { apiKey } = providerRequest
+    if (apiKey === 'CURRENT_KEY_ON_DISK') {
+      apiKey = await SecureSecrets.getSecret(`${provider}Key`)
+    }
+    apiKey = (apiKey || '').trim()
+    if (!apiKey) {
+      return {
+        success: false,
+        message: `${provider.toUpperCase()} API key is missing. Please enter an API key.`
+      }
+    }
+    // Reset circuit breaker so testing a key doesn't fail on a stale open breaker
+    resetLlmCircuit()
+    const client = LlmProviderFactory.getProvider(provider)
+    const baseUrl =
+      provider === 'custom'
+        ? (providerRequest.baseUrl ?? (await SettingsStore.getSettings()).customBaseUrl)
+        : undefined
+    return await client.testConnection({ apiKey, baseUrl }, modelId?.trim())
+  })
+
+  ipcMain.handle('settings:testPexelsKey', async (_, rawKey: unknown) => {
+    try {
+      const apiKey = PexelsKeySchema.parse(rawKey) ?? ''
+      let activeKey = apiKey
+      if (activeKey === 'CURRENT_KEY_ON_DISK') {
+        activeKey = await SecureSecrets.getSecret('pexelsKey')
+      }
+      activeKey = (activeKey || '').trim()
+      if (!activeKey) {
+        return {
+          success: false,
+          message: 'Pexels API key is missing. Please enter an API key.'
+        }
+      }
+      // Reset circuit breaker so testing a key doesn't fail on a stale open breaker
+      PexelsClient.resetCircuit()
+      const response = await fetch('https://api.pexels.com/v1/search?query=test&per_page=1', {
+        headers: { Authorization: activeKey },
+        signal: AbortSignal.timeout(15_000)
+      })
+      if (response.ok) {
+        return { success: true, message: 'Pexels API key is valid!' }
+      }
+      if (response.status === 401 || response.status === 403) {
+        return {
+          success: false,
+          message: `Invalid Pexels API key. Authentication failed (HTTP ${response.status}).`
+        }
+      }
+      if (response.status === 429) {
+        return {
+          success: false,
+          message: 'Pexels API rate limit reached (HTTP 429). Please try again later.'
+        }
+      }
+      return { success: false, message: `Pexels API error: HTTP ${response.status}` }
+    } catch (err) {
+      return { success: false, message: err instanceof Error ? err.message : String(err) }
+    }
+  })
+
+  ipcMain.handle('settings:testPixabayKey', async (_, rawKey: unknown) => {
+    try {
+      const apiKey = PexelsKeySchema.parse(rawKey) ?? ''
+      let activeKey = apiKey
+      if (activeKey === 'CURRENT_KEY_ON_DISK') {
+        activeKey = await SecureSecrets.getSecret('pixabayKey')
+      }
+      activeKey = (activeKey || '').trim()
+      if (!activeKey) {
+        return {
+          success: false,
+          message: 'Pixabay API key is missing. Please enter an API key.'
+        }
+      }
+      // Reset circuit breaker so testing a key doesn't fail on a stale open breaker
+      PixabayClient.resetCircuit()
+      const response = await fetch(
+        buildPixabayPhotoSearchUrl(
+          { query: 'test', per_page: 3 },
+          { apiKey: activeKey, safeSearch: true }
+        ),
+        { signal: AbortSignal.timeout(15_000) }
+      )
+      if (response.ok) {
+        return { success: true, message: 'Pixabay API key is valid!' }
+      }
+      if (response.status === 429) {
+        return {
+          success: false,
+          message: 'Pixabay API rate limit reached (HTTP 429). Please try again later.'
+        }
+      }
+      // Pixabay answers a bad key with HTTP 400 and a plain-text reason.
+      const reason = (await response.text().catch(() => '')).slice(0, 200).trim()
+      return {
+        success: false,
+        message: `Pixabay API error: HTTP ${response.status}${reason ? ` - ${reason}` : ''}`
+      }
+    } catch (err) {
+      return { success: false, message: err instanceof Error ? err.message : String(err) }
+    }
+  })
+
+  ipcMain.handle('settings:chooseDownloadFolder', async () => {
+    const result = await dialog.showOpenDialog({
+      properties: ['openDirectory']
+    })
+    return result.canceled ? null : result.filePaths[0]
+  })
+
+  ipcMain.handle('settings:openAppDataFolder', async () => {
+    const appDataPath = app.getPath('userData')
+    const openError = await shell.openPath(appDataPath)
+    if (openError) {
+      throw new Error(`Failed to open app data folder: ${openError}`)
+    }
+  })
+}

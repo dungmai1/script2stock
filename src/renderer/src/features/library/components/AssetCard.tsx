@@ -1,0 +1,99 @@
+import React from 'react'
+import { InfoIcon } from '@phosphor-icons/react'
+import { Badge } from '@renderer/components/ui/badge'
+import { Card } from '@renderer/components/ui/card'
+import { cn } from '@renderer/lib/utils'
+import type { FlatAsset } from '../types'
+import { assetFilename, assetPageUrl, buildCreditLine, formatDuration } from '../utils'
+
+interface AssetCardProps {
+  asset: FlatAsset
+  selected: boolean
+  onSelect: (asset: FlatAsset) => void
+}
+
+function StatusBadge({ status }: { status: FlatAsset['status'] }): React.JSX.Element {
+  if (status === 'completed') {
+    return (
+      <Badge className="border-2 border-foreground bg-primary text-[11px] font-bold tracking-widest text-primary-foreground uppercase shadow-sm">
+        Ready
+      </Badge>
+    )
+  }
+  if (status === 'failed') {
+    return (
+      <Badge className="border-2 border-foreground bg-error-container text-[11px] font-bold tracking-widest text-on-error-container uppercase shadow-sm">
+        Failed
+      </Badge>
+    )
+  }
+  return (
+    <Badge className="animate-pulse border-2 border-foreground bg-muted text-[11px] font-bold tracking-widest text-foreground uppercase shadow-sm">
+      Active
+    </Badge>
+  )
+}
+
+export function AssetCard({ asset, selected, onSelect }: AssetCardProps): React.JSX.Element {
+  const filename = assetFilename(asset)
+  const durationStr = formatDuration(asset.duration)
+
+  return (
+    <Card
+      role="button"
+      tabIndex={0}
+      onClick={() => onSelect(asset)}
+      onKeyDown={(e) => {
+        if (e.key === 'Enter' || e.key === ' ') {
+          e.preventDefault()
+          onSelect(asset)
+        }
+      }}
+      className={cn(
+        'group relative h-[320px] cursor-pointer gap-0 overflow-hidden border-border p-0 transition-all duration-300 hover:scale-[1.01] hover:shadow-md',
+        selected && 'ring-4 ring-secondary'
+      )}
+    >
+      <div className="absolute top-3 left-3 z-10">
+        <StatusBadge status={asset.status} />
+      </div>
+
+      <div className="relative h-48 w-full overflow-hidden border-b-2 border-border bg-black">
+        <img
+          className="h-full w-full object-cover opacity-90 mix-blend-luminosity transition-transform duration-500 group-hover:scale-105 group-hover:opacity-100 hover:mix-blend-normal"
+          src={asset.imageUrl}
+          alt={filename}
+        />
+        <div className="absolute inset-0 bg-linear-to-t from-black/60 to-transparent" />
+        {durationStr && (
+          <span className="absolute right-2 bottom-2 rounded-sm border border-white/20 bg-black/80 px-2 py-0.5 font-label-sm text-[11px] text-white">
+            {durationStr}
+          </span>
+        )}
+      </div>
+
+      <div className="flex flex-1 flex-col justify-between p-4">
+        <div>
+          <h3 className="truncate font-title-md text-[16px] leading-tight font-bold text-card-foreground">
+            {filename}
+          </h3>
+          <p className="mt-1 font-body-md text-[12px] text-muted-foreground">
+            {asset.width}x{asset.height} • {asset.type.toUpperCase()}
+          </p>
+        </div>
+        <div className="mt-3 flex items-center justify-between gap-2 border-t-2 border-dashed border-border pt-3">
+          <a
+            href={asset.photographerUrl || assetPageUrl(asset)}
+            target="_blank"
+            rel="noreferrer"
+            onClick={(e) => e.stopPropagation()}
+            className="truncate font-label-sm text-[11px] tracking-wider text-muted-foreground uppercase hover:text-secondary hover:underline"
+          >
+            {buildCreditLine(asset)}
+          </a>
+          <InfoIcon size={16} className="shrink-0 text-foreground" />
+        </div>
+      </div>
+    </Card>
+  )
+}

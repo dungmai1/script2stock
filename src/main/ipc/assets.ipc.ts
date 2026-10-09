@@ -1,0 +1,223 @@
+import { ipcMain, shell } from 'electron'
+import { ProjectStore } from '../services/storage/project-store'
+import { promises as fs } from 'fs'
+import { join } from 'path'
+import { VisualBeat } from '../services/agent/agent-runner'
+import { buildManifestAttribution } from '../services/pexels/pexels-attribution'
+import { getStockClient } from '../services/pexels/stock-client'
+import { normalizeStockSource } from '../services/pexels/stock-source'
+import { ManifestWriter } from '../services/files/manifest-writer'
+import { isPathInside } from '../services/files/path-safety'
+import { z } from 'zod'
+
+const JobIdSchema = z.string().regex(/^job_\d+$/)
+const AssetIdSchema = z.string().regex(/^(photo|video)_\d+$/)
+
+export function registerAssetsHandlers(): void {
+  ipcMain.handle('assets:list', async (_, rawJobId: unknown): Promise<unknown[]> => {
+    const jobId = JobIdSchema.parse(rawJobId)
+    const summary = await ProjectStore.get(jobId)
+    if (!summary) return []
+
+    try {
+      const manifestPath = join(summary.downloadPath, 'manifest.json')
+      const data = await fs.readFile(manifestPath, 'utf-8')
+      const manifest = JSON.parse(data) as { beats?: VisualBeat[] }
+
+      let manifestDirty = false
+      const assets: unknown[] = []
+
+      if (manifest.beats) {
+        const checkTasks: Array<{
+          asset: NonNullable<NonNullable<VisualBeat['assets']>[number]>
+        }> = []
+
+        for (const beat of manifest.beats) {
+          if (beat.assets) {
+            for (const asset of beat.assets) {
+              if (asset.status === 'completed' && asset.filePath) {
+                checkTasks.push({ asset })
+              }
+            }
+          }
+        }
+
+        if (checkTasks.length > 0) {
+          const results = await Promise.all(
+            checkTasks.map(async ({ asset }) => {
+              try {
+                await fs.access(asset.filePath!)
+                return true
+              } catch {
+                return false
+              }
+            })
+          )
+
+          for (let i = 0; i < checkTasks.length; i++) {
+            if (!results[i]) {
+              const { asset } = checkTasks[i]
+              asset.status = 'failed'
+              asset.error = 'File not found on disk'
+              asset.filePath = undefined
+              manifestDirty = true
+            }
+          }
+        }
+
+        for (const beat of manifest.beats) {
+          if (beat.assets) {
+            for (const asset of beat.assets) {
+              assets.push({
+                ...asset,
+                beatId: beat.id,
+                beatText: beat.text
+              })
+            }
+          }
+        }
+      }
+
+      // Persist corrections so manifest stays in sync (queued + atomic)
+      if (manifestDirty) {
+        ManifestWriter.writeJsonFile(summary.downloadPath, 'manifest.json', manifest).catch((err) =>
+          console.error('Failed to update manifest after file-existence check:', err)
+        )
+      }
+
+      return assets
+    } catch {
+      return []
+    }
+  })
+
+  ipcMain.handle(
+    'assets:openInFolder',
+    async (_, rawJobId: unknown, rawAssetId: unknown): Promise<void> => {
+      const jobId = JobIdSchema.parse(rawJobId)
+      const assetId = AssetIdSchema.parse(rawAssetId)
+      const summary = await ProjectStore.get(jobId)
+      if (!summary) return
+
+      try {
+        const manifestPath = join(summary.downloadPath, 'manifest.json')
+        const data = await fs.readFile(manifestPath, 'utf-8')
+        const manifest = JSON.parse(data) as { beats?: VisualBeat[] }
+
+        if (manifest.beats) {
+          for (const beat of manifest.beats) {
+            const asset = beat.assets?.find((a) => a.id === assetId)
+            if (asset && asset.filePath && isPathInside(summary.downloadPath, asset.filePath)) {
+              shell.showItemInFolder(asset.filePath)
+              return
+            }
+          }
+        }
+      } catch (err) {
+        console.error('Failed to open asset in folder:', err)
+      }
+    }
+  )
+
+  ipcMain.handle(
+    'assets:deleteLocal',
+    async (_, rawJobId: unknown, rawAssetId: unknown): Promise<void> => {
+      const jobId = JobIdSchema.parse(rawJobId)
+      const assetId = AssetIdSchema.parse(rawAssetId)
+      const summary = await ProjectStore.get(jobId)
+      if (!summary) return
+
+      try {
+        const manifestPath = join(summary.downloadPath, 'manifest.json')
+        const data = await fs.readFile(manifestPath, 'utf-8')
+        const manifest = JSON.parse(data) as { beats?: VisualBeat[] }
+
+        let manifestModified = false
+        if (manifest.beats) {
+          for (const beat of manifest.beats) {
+            const asset = beat.assets?.find((a) => a.id === assetId)
+            if (asset) {
+              if (asset.filePath && isPathInside(summary.downloadPath, asset.filePath)) {
+                try {
+                  await fs.unlink(asset.filePath)
+                } catch (unlinkErr) {
+                  const code = (unlinkErr as NodeJS.ErrnoException).code
+                  // Only treat missing files as already-deleted. Permission or
+                  // lock errors must abort so the manifest keeps the real path.
+                  if (code !== 'ENOENT') {
+                    throw unlinkErr
+                  }
+                }
+              }
+              asset.status = 'failed'
+              asset.error = 'Deleted by user'
+              asset.filePath = undefined
+              manifestModified = true
+            }
+          }
+        }
+
+        if (manifestModified) {
+          // Save manifest changes through the shared write queue
+          await ManifestWriter.writeJsonFile(summary.downloadPath, 'manifest.json', manifest)
+
+          // Recalculate downloaded asset count in project registry
+          const activeCount =
+            manifest.beats?.flatMap((b) => b.assets || [])?.filter((a) => a.status === 'completed')
+              ?.length || 0
+
+          summary.assetCount = activeCount
+          await ProjectStore.save(summary)
+        }
+      } catch (err) {
+        console.error('Failed to delete asset locally:', err)
+        throw err
+      }
+    }
+  )
+
+  ipcMain.handle('assets:exportManifest', async (_, rawJobId: unknown): Promise<string> => {
+    const jobId = JobIdSchema.parse(rawJobId)
+    const summary = await ProjectStore.get(jobId)
+    if (!summary) throw new Error('Job not found')
+
+    const manifestPath = join(summary.downloadPath, 'manifest.json')
+    const raw = await fs.readFile(manifestPath, 'utf-8')
+    const manifest = JSON.parse(raw) as {
+      beats?: VisualBeat[]
+      attribution?: unknown
+      pexelsQuotaSnapshot?: unknown
+      settingsSnapshot?: { stockSource?: unknown }
+    }
+    const stockSource = normalizeStockSource(manifest.settingsSnapshot?.stockSource)
+
+    const flatAssets =
+      manifest.beats?.flatMap((beat) =>
+        (beat.assets || []).map((asset) => ({
+          id: asset.id,
+          type: asset.type,
+          pexelsId: asset.pexelsId,
+          url: asset.url,
+          photographer: asset.photographer,
+          photographerUrl: asset.photographerUrl
+        }))
+      ) || []
+
+    manifest.attribution = buildManifestAttribution(flatAssets, stockSource)
+    manifest.pexelsQuotaSnapshot =
+      getStockClient(stockSource).getQuotaSnapshot() || manifest.pexelsQuotaSnapshot
+
+    return JSON.stringify(manifest, null, 2)
+  })
+
+  ipcMain.handle('assets:openProjectFolder', async (_, rawJobId: unknown): Promise<void> => {
+    const jobId = JobIdSchema.parse(rawJobId)
+    const summary = await ProjectStore.get(jobId)
+    if (!summary || !summary.downloadPath) return
+
+    const openError = await shell.openPath(summary.downloadPath)
+    if (openError) {
+      throw new Error(`Failed to open project folder: ${openError}`)
+    }
+  })
+}

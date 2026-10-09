@@ -1,0 +1,339 @@
+@import 'tailwindcss';
+@import 'tw-animate-css';
+@custom-variant dark (&:where(.dark, .dark *));
+
+/*
+ * Design tokens. See docs/design-system.md.
+ *
+ * - Light is the default (:root). `.theme-flat-black` (set on <html>) overrides every
+ *   themed colour with a literal value, so there are no cross-references to go stale.
+ * - Every text/surface pair is verified by `npm run check:contrast` (WCAG AA).
+ * - Semantic roles: surface-* (backgrounds), on-* (text on that fill), outline (muted
+ *   text + control borders), border (dividers), primary-container (lime: selected / main
+ *   action), secondary(-container) (violet: AI actions), error(-container), ink-black
+ *   (strong brutalist edge), hard-shadow (offset shadow colour), edge (container borders:
+ *   strong in light, subtle in dark), control (form-control borders, >= 3:1).
+ */
+@theme static {
+  --color-background: #fafafb;
+  --color-on-background: #121214;
+  --color-foreground: #121214;
+  --color-surface: #fafafb;
+  --color-surface-container-lowest: #ffffff;
+  --color-surface-container-low: #f4f4f6;
+  --color-surface-container: #ececf0;
+  --color-surface-container-high: #e2e2e8;
+  --color-surface-container-highest: #d6d6de;
+  --color-surface-variant: #e2e2e8;
+  --color-on-surface: #121214;
+  --color-on-surface-variant: #3f3f49;
+  --color-outline: #585865;
+  --color-outline-variant: #c9c9d3;
+  --color-border: #c9c9d3;
+  --color-input: #ffffff;
+  --color-ring: #7c3aed;
+  --color-primary: #465800;
+  --color-on-primary: #ffffff;
+  --color-primary-container: #ccff00;
+  --color-on-primary-container: #182000;
+  --color-secondary: #6d1fc0;
+  --color-on-secondary: #ffffff;
+  --color-secondary-container: #7c3aed;
+  --color-on-secondary-container: #ffffff;
+  --color-tertiary: #2f5170;
+  --color-on-tertiary: #ffffff;
+  --color-tertiary-container: #d6e8f7;
+  --color-on-tertiary-container: #0e2a40;
+  --color-error: #b00f14;
+  --color-on-error: #ffffff;
+  --color-error-container: #ffdad6;
+  --color-on-error-container: #7a0008;
+  --color-ink-black: #18181b;
+  --color-paper-white: #ffffff;
+  --color-hard-shadow: #18181b;
+  --color-edge: #18181b;
+  --color-control: #85859a;
+  --color-card: #f4f4f6;
+  --color-card-foreground: #121214;
+  --color-popover: #ffffff;
+  --color-popover-foreground: #121214;
+  --color-primary-foreground: #ffffff;
+  --color-secondary-foreground: #ffffff;
+  --color-muted: #ececf0;
+  --color-muted-foreground: #585865;
+  --color-accent: #e2e2e8;
+  --color-accent-foreground: #121214;
+  --color-destructive: #b00f14;
+  --color-steel-secondary: #585865;
+  --color-risograph-gray: #585865;
+
+  /* Brand constants (identical in both themes) */
+  --color-cyber-lime: #ccff00;
+  --color-electric-purple: #a855f7;
+
+  /* Elevation scale: soft, layered, neutral shadows (a tight contact shadow plus a
+     wide ambient one). xs = small chips/thumbs, sm = buttons and small tiles,
+     md = cards, lg = floating layers (dialogs, menus, popovers, sheets). */
+  --shadow-ink: 24 24 27;
+  --shadow-xs: 0 1px 2px rgb(var(--shadow-ink) / 0.08);
+  --shadow-sm: 0 1px 2px rgb(var(--shadow-ink) / 0.08), 0 2px 6px rgb(var(--shadow-ink) / 0.06);
+  --shadow-md: 0 1px 2px rgb(var(--shadow-ink) / 0.06), 0 4px 12px rgb(var(--shadow-ink) / 0.08),
+    0 12px 24px -8px rgb(var(--shadow-ink) / 0.08);
+  --shadow-lg: 0 2px 4px rgb(var(--shadow-ink) / 0.06), 0 8px 24px rgb(var(--shadow-ink) / 0.12),
+    0 24px 48px -12px rgb(var(--shadow-ink) / 0.16);
+
+  --spacing-grid-margin: 2rem;
+  --spacing-component-padding: 1.5rem;
+  --spacing-gutter: 1.5rem;
+  --spacing-section-gap: 4rem;
+
+  /* Two-tier radius scale. Controls (buttons, inputs, badges, tabs) use md (8px);
+     containers (cards, dialogs, popovers) use xl (12px). Use sm (6px) for small
+     tiles nested inside a control. Only true circles (status dots, radio) are
+     rounded-full; nothing else is a pill. */
+  --radius: 0.5rem;
+  --radius-xs: 0.25rem;
+  --radius-sm: 0.375rem;
+  --radius-md: 0.5rem;
+  --radius-lg: 0.75rem;
+  --radius-xl: 0.75rem;
+  --radius-2xl: 1rem;
+  --radius-3xl: 1rem;
+}
+
+.theme-flat-black {
+  --color-background: #0b0b0d;
+  --color-on-background: #f4f4f5;
+  --color-foreground: #f4f4f5;
+  --color-surface: #0b0b0d;
+  --color-surface-container-lowest: #060607;
+  --color-surface-container-low: #111114;
+  --color-surface-container: #18181c;
+  --color-surface-container-high: #212126;
+  --color-surface-container-highest: #2b2b32;
+  --color-surface-variant: #212126;
+  --color-on-surface: #f4f4f5;
+  --color-on-surface-variant: #c3c3cc;
+  --color-outline: #9d9da9;
+  --color-outline-variant: #34343d;
+  --color-border: #34343d;
+  --color-input: #060607;
+  --color-ring: #7c3aed;
+  --color-primary: #c3f400;
+  --color-on-primary: #182000;
+  --color-primary-container: #ccff00;
+  --color-on-primary-container: #182000;
+  --color-secondary: #c9a8ff;
+  --color-on-secondary: #2a0a55;
+  --color-secondary-container: #7c3aed;
+  --color-on-secondary-container: #ffffff;
+  --color-tertiary: #9cc7e8;
+  --color-on-tertiary: #0e2a40;
+  --color-tertiary-container: #1d3347;
+  --color-on-tertiary-container: #d6e8f7;
+  --color-error: #ff9a90;
+  --color-on-error: #3a0003;
+  --color-error-container: #5c0a10;
+  --color-on-error-container: #ffdad6;
+  --color-ink-black: #f4f4f5;
+  --color-paper-white: #060607;
+  --color-hard-shadow: #ccff00;
+  /* Dark surfaces swallow soft shadows, so use pure black at higher alpha and add a
+     faint top highlight to the raised layers. */
+  --shadow-ink: 0 0 0;
+  --shadow-xs: 0 1px 2px rgb(0 0 0 / 0.5);
+  --shadow-sm: 0 1px 2px rgb(0 0 0 / 0.5), 0 2px 8px rgb(0 0 0 / 0.35);
+  --shadow-md: inset 0 1px 0 rgb(255 255 255 / 0.04), 0 1px 2px rgb(0 0 0 / 0.5),
+    0 6px 16px rgb(0 0 0 / 0.45), 0 16px 32px -8px rgb(0 0 0 / 0.5);
+  --shadow-lg: inset 0 1px 0 rgb(255 255 255 / 0.06), 0 2px 4px rgb(0 0 0 / 0.5),
+    0 12px 32px rgb(0 0 0 / 0.6), 0 32px 64px -12px rgb(0 0 0 / 0.7);
+  --color-edge: #3b3b45;
+  --color-control: #70707d;
+  --color-card: #111114;
+  --color-card-foreground: #f4f4f5;
+  --color-popover: #212126;
+  --color-popover-foreground: #f4f4f5;
+  --color-primary-foreground: #182000;
+  --color-secondary-foreground: #2a0a55;
+  --color-muted: #18181c;
+  --color-muted-foreground: #9d9da9;
+  --color-accent: #212126;
+  --color-accent-foreground: #f4f4f5;
+  --color-destructive: #ff9a90;
+  --color-steel-secondary: #9d9da9;
+  --color-risograph-gray: #9d9da9;
+}
+
+@layer base {
+  body {
+    @apply bg-background text-on-surface antialiased selection:bg-secondary-container/30 selection:text-on-surface;
+    font-family: var(--font-sans);
+  }
+  /* Visible keyboard focus everywhere; components opt out with their own ring. */
+  :focus-visible {
+    outline-color: var(--color-ring);
+  }
+}
+
+/* Scrollbars follow the theme */
+::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+::-webkit-scrollbar-thumb {
+  background: color-mix(in oklab, var(--color-on-surface) 22%, transparent);
+  border-radius: 6px;
+  border: 2px solid transparent;
+  background-clip: content-box;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: color-mix(in oklab, var(--color-on-surface) 40%, transparent);
+  background-clip: content-box;
+}
+
+@keyframes float {
+  0%,
+  100% {
+    transform: translateY(0);
+  }
+  50% {
+    transform: translateY(-6px);
+  }
+}
+
+.animate-float {
+  animation: float 4s ease-in-out infinite;
+}
+
+@keyframes fadeInUp {
+  from {
+    opacity: 0;
+    transform: translateY(10px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+/* Route/tab switch: opacity only, so the page never shifts position. */
+@keyframes pageIn {
+  from {
+    opacity: 0;
+  }
+  to {
+    opacity: 1;
+  }
+}
+
+.animate-page-in {
+  animation: pageIn 0.18s ease-out;
+}
+
+.animate-fade-in-up {
+  animation: fadeInUp 0.5s ease-out forwards;
+}
+
+/* Redesign Fonts Utilities */
+.font-display-xl {
+  font-family: 'Cabinet Grotesk', sans-serif;
+}
+.text-display-xl {
+  font-size: 64px;
+  line-height: 1.1;
+  letter-spacing: -0.04em;
+  font-weight: 900;
+}
+.font-headline-lg {
+  font-family: 'Cabinet Grotesk', sans-serif;
+}
+.text-headline-lg {
+  font-size: 48px;
+  line-height: 1.2;
+  letter-spacing: -0.02em;
+  font-weight: 800;
+}
+.font-title-md {
+  font-family: 'Cabinet Grotesk', sans-serif;
+}
+.text-title-md {
+  font-size: 24px;
+  line-height: 1.3;
+  font-weight: 700;
+}
+.font-body-lg {
+  font-family: 'Satoshi', sans-serif;
+}
+.text-body-lg {
+  font-size: 18px;
+  line-height: 1.6;
+  font-weight: 400;
+}
+.font-body-md {
+  font-family: 'Satoshi', sans-serif;
+}
+.text-body-md {
+  font-size: 16px;
+  line-height: 1.6;
+  font-weight: 400;
+}
+.font-label-sm {
+  font-family: 'Satoshi', sans-serif;
+}
+.text-label-sm {
+  font-size: 14px;
+  line-height: 1.25;
+  letter-spacing: 0.05em;
+  font-weight: 700;
+}
+
+/* Brutalist utilities */
+.brutal-border {
+  border: 2px solid var(--color-ink-black) !important;
+}
+.brutal-shadow {
+  box-shadow: var(--shadow-md);
+}
+
+/* Dark text on lime fills in both themes */
+.text-on-lime {
+  color: var(--color-on-primary-container);
+}
+
+/* Stroke effect on light backgrounds */
+.brand-logo-stroke {
+  filter: drop-shadow(1px 0 0 rgba(0, 0, 0, 0.4)) drop-shadow(-1px 0 0 rgba(0, 0, 0, 0.4))
+    drop-shadow(0 1px 0 rgba(0, 0, 0, 0.4)) drop-shadow(0 -1px 0 rgba(0, 0, 0, 0.4))
+    drop-shadow(0 2px 4px rgba(0, 0, 0, 0.15));
+  transition: filter 0.2s ease;
+}
+
+/* In dark mode, remove the stroke */
+.dark .brand-logo-stroke,
+.theme-flat-black .brand-logo-stroke {
+  filter: none;
+}
+
+/* Liquid metal button (components/ui/liquid-metal-button.tsx) */
+.liquid-metal-shader canvas {
+  position: absolute;
+  inset: 0;
+  display: block;
+  width: 100% !important;
+  height: 100% !important;
+  border-radius: 100px;
+}
+
+@keyframes liquid-metal-ripple {
+  from {
+    transform: translate(-50%, -50%) scale(0);
+    opacity: 0.6;
+  }
+  to {
+    transform: translate(-50%, -50%) scale(4);
+    opacity: 0;
+  }
+}

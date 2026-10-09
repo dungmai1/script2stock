@@ -1,0 +1,57 @@
+# StockFinder AI — robots.txt
+# Sitemaps
+Sitemap: https://stockfinderai.birol.tech/sitemap.xml
+
+# Default for all search crawlers
+User-agent: *
+Allow: /
+Disallow: /404.html
+
+# Googlebot (Search & Mobile-first indexing)
+User-agent: Googlebot
+Allow: /
+Disallow: /404.html
+
+# Googlebot Images
+User-agent: Googlebot-Image
+Allow: /logos/
+Allow: /
+
+# Bingbot
+User-agent: Bingbot
+Allow: /
+Disallow: /404.html
+
+# Google Gemini & AI Overviews
+User-agent: Google-Extended
+Allow: /
+
+# OpenAI (ChatGPT search & citations)
+User-agent: GPTBot
+Allow: /
+
+User-agent: ChatGPT-User
+Allow: /
+
+# Anthropic (Claude)
+User-agent: ClaudeBot
+Allow: /
+
+User-agent: anthropic-ai
+Allow: /
+
+# Perplexity AI
+User-agent: PerplexityBot
+Allow: /
+
+# Apple Intelligence / Spotlight
+User-agent: Applebot
+Allow: /
+
+# Meta AI
+User-agent: Meta-ExternalAgent
+Allow: /
+
+# Cohere
+User-agent: cohere-ai
+Allow: /

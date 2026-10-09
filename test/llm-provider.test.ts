@@ -1,0 +1,1120 @@
+import assert from 'node:assert/strict'
+import { afterEach, beforeEach, describe, it } from 'node:test'
+import {
+  LlmProviderFactory,
+  LLM_STRUCTURED_MAX_OUTPUT_TOKENS,
+  LLM_STRUCTURED_REASONING,
+  normalizeChatToolCalls,
+  resolveCustomChatCompletionsUrl,
+  toOpenRouterReasoningPayload
+} from '../src/main/services/llm/llm-provider.ts'
+import type { NormalizedToolDefinition } from '../src/main/services/llm/llm-provider.ts'
+import { resetLlmCircuit } from '../src/main/services/llm/llm-fetch.ts'
+
+const originalFetch = globalThis.fetch
+
+beforeEach(() => {
+  resetLlmCircuit()
+})
+
+afterEach(() => {
+  globalThis.fetch = originalFetch
+  resetLlmCircuit()
+})
+
+const sampleTools: NormalizedToolDefinition[] = [
+  {
+    name: 'search_pexels_photos',
+    description: 'Search for photos',
+    parameters: {
+      type: 'object',
+      properties: {
+        query: { type: 'string' }
+      },
+      required: ['query']
+    }
+  }
+]
+
+describe('LlmProviderFactory', () => {
+  it('returns valid providers for openai, openrouter, and gemini', () => {
+    assert.equal(LlmProviderFactory.getProvider('openai').id, 'openai')
+    assert.equal(LlmProviderFactory.getProvider('openrouter').id, 'openrouter')
+    assert.equal(LlmProviderFactory.getProvider('gemini').id, 'gemini')
+  })
+
+  it('throws for unknown provider', () => {
+    assert.throws(
+      () => LlmProviderFactory.getProvider('unknown' as 'openai'),
+      /Unknown LLM provider ID/
+    )
+  })
+})
+
+describe('OpenAiProvider', () => {
+  const provider = LlmProviderFactory.getProvider('openai')
+
+  it('rejects testConnection when API key is missing', async () => {
+    const result = await provider.testConnection({ apiKey: '' }, 'gpt-4o')
+    assert.equal(result.success, false)
+    assert.ok(result.message.includes('missing'))
+  })
+
+  it('sends correct format and parses tool calls in createToolTurn', async () => {
+    let capturedPayload: Record<string, unknown> | null = null
+    let capturedHeaders: HeadersInit | undefined = undefined
+
+    globalThis.fetch = (async (_url: string, init?: RequestInit) => {
+      capturedHeaders = init?.headers
+      capturedPayload = JSON.parse(init?.body as string) as Record<string, unknown>
+
+      return {
+        ok: true,
+        status: 200,
+        headers: new Headers(),
+        json: async () => ({
+          choices: [
+            {
+              message: {
+                content: 'I will search for photos',
+                tool_calls: [
+                  {
+                    id: 'call_123',
+                    type: 'function',
+                    function: {
+                      name: 'search_pexels_photos',
+                      arguments: '{"query":"mountains"}'
+                    }
+                  }
+                ]
+              },
+              finish_reason: 'tool_calls'
+            }
+          ],
+          usage: {
+            prompt_tokens: 25,
+            completion_tokens: 15,
+            total_tokens: 40
+          }
+        })
+      } as Response
+    }) as typeof globalThis.fetch
+
+    const result = await provider.createToolTurn(
+      {
+        model: ' gpt-4o ',
+        systemPrompt: 'You are an assistant',
+        messages: [{ role: 'user', content: 'Find mountain pictures' }],
+        tools: sampleTools,
+        toolChoice: 'auto',
+        temperature: 0.2,
+        maxOutputTokens: 1000
+      },
+      { apiKey: ' sk-test-key ' }
+    )
+
+    const headersRecord = capturedHeaders as Record<string, string>
+    assert.equal(headersRecord?.Authorization, 'Bearer sk-test-key')
+    assert.equal(capturedPayload?.model, 'gpt-4o')
+    assert.equal(capturedPayload?.max_completion_tokens, 1000)
+    assert.equal(capturedPayload?.max_tokens, undefined)
+    assert.equal(capturedPayload?.cache_control, undefined)
+    assert.equal(capturedPayload?.session_id, undefined)
+    const messages = capturedPayload?.messages as Array<{ role: string }>
+    assert.equal(messages?.[0]?.role, 'system')
+    assert.equal(messages?.[1]?.role, 'user')
+    const tools = capturedPayload?.tools as Array<{ function: { name: string } }>
+    assert.equal(tools?.[0]?.function?.name, 'search_pexels_photos')
+    // Do not enable strict tool schemas (our schemas are not OpenAI-strict compliant)
+    assert.equal((tools?.[0] as { function?: { strict?: unknown } })?.function?.strict, undefined)
+    assert.equal((tools?.[0] as { strict?: unknown })?.strict, undefined)
+
+    assert.equal(result.stopReason, 'tool_calls')
+    assert.equal(result.toolCalls.length, 1)
+    assert.equal(result.toolCalls[0].name, 'search_pexels_photos')
+    assert.equal(result.toolCalls[0].arguments, '{"query":"mountains"}')
+    assert.equal(result.usage?.totalTokens, 40)
+  })
+
+  it('sends user images as image_url parts after the text', async () => {
+    let capturedPayload: Record<string, unknown> | null = null
+
+    globalThis.fetch = (async (_url: string, init?: RequestInit) => {
+      capturedPayload = JSON.parse(init?.body as string) as Record<string, unknown>
+      return {
+        ok: true,
+        status: 200,
+        headers: new Headers(),
+        json: async () => ({
+          choices: [{ message: { content: 'ok' }, finish_reason: 'stop' }]
+        })
+      } as Response
+    }) as typeof globalThis.fetch
+
+    await provider.createToolTurn(
+      {
+        model: 'gpt-4o',
+        systemPrompt: 'Review frames',
+        messages: [
+          { role: 'user', content: 'Two frames follow.', images: ['data:image/jpeg;base64,AAAA'] },
+          { role: 'user', content: 'No images here.' }
+        ],
+        tools: [],
+        toolChoice: 'none',
+        temperature: 0.1,
+        maxOutputTokens: 100
+      },
+      { apiKey: 'sk-test' }
+    )
+
+    const users = (capturedPayload?.messages as Array<{ role: string; content: unknown }>).filter(
+      (m) => m.role === 'user'
+    )
+    assert.deepEqual(users[0].content, [
+      { type: 'text', text: 'Two frames follow.' },
+      { type: 'image_url', image_url: { url: 'data:image/jpeg;base64,AAAA' } }
+    ])
+    assert.equal(users[1].content, 'No images here.')
+  })
+
+  it('allows content null on outbound assistant messages that have tool_calls', async () => {
+    let capturedPayload: Record<string, unknown> | null = null
+
+    globalThis.fetch = (async (_url: string, init?: RequestInit) => {
+      capturedPayload = JSON.parse(init?.body as string) as Record<string, unknown>
+      return {
+        ok: true,
+        status: 200,
+        headers: new Headers(),
+        json: async () => ({
+          choices: [
+            {
+              message: { content: 'done', tool_calls: undefined },
+              finish_reason: 'stop'
+            }
+          ]
+        })
+      } as Response
+    }) as typeof globalThis.fetch
+
+    await provider.createToolTurn(
+      {
+        model: 'gpt-4o',
+        systemPrompt: 'You are an assistant',
+        messages: [
+          { role: 'user', content: 'Find mountains' },
+          {
+            role: 'assistant',
+            content: null,
+            tool_calls: [
+              {
+                id: 'call_abc',
+                name: 'search_pexels_photos',
+                arguments: '{"query":"mountains"}'
+              }
+            ]
+          },
+          {
+            role: 'tool',
+            tool_call_id: 'call_abc',
+            name: 'search_pexels_photos',
+            content: '{"results":[]}'
+          }
+        ],
+        tools: sampleTools,
+        toolChoice: 'auto',
+        temperature: 0.2,
+        maxOutputTokens: 500
+      },
+      { apiKey: 'sk-test' }
+    )
+
+    const messages = capturedPayload?.messages as Array<{
+      role: string
+      content: string | null
+      tool_calls?: unknown[]
+    }>
+    const assistantMsg = messages.find((m) => m.role === 'assistant')
+    assert.ok(assistantMsg)
+    assert.equal(assistantMsg?.content, null)
+    assert.ok(assistantMsg?.tool_calls && assistantMsg.tool_calls.length > 0)
+  })
+
+  it('sets stopReason tool_calls when tool_calls present even if finish_reason is stop', async () => {
+    globalThis.fetch = (async () =>
+      ({
+        ok: true,
+        status: 200,
+        headers: new Headers(),
+        json: async () => ({
+          choices: [
+            {
+              message: {
+                content: null,
+                tool_calls: [
+                  {
+                    id: 'call_xyz',
+                    type: 'function',
+                    function: { name: 'search_pexels_photos', arguments: '{"query":"x"}' }
+                  }
+                ]
+              },
+              finish_reason: 'stop'
+            }
+          ]
+        })
+      }) as Response) as typeof globalThis.fetch
+
+    const result = await provider.createToolTurn(
+      {
+        model: 'gpt-4o',
+        systemPrompt: '',
+        messages: [{ role: 'user', content: 'hi' }],
+        tools: sampleTools,
+        toolChoice: 'auto',
+        temperature: 0.1,
+        maxOutputTokens: 100
+      },
+      { apiKey: 'sk-test' }
+    )
+    assert.equal(result.stopReason, 'tool_calls')
+    assert.equal(result.toolCalls.length, 1)
+  })
+})
+
+describe('OpenRouterProvider', () => {
+  const provider = LlmProviderFactory.getProvider('openrouter')
+
+  it('rejects testConnection when API key is missing', async () => {
+    const result = await provider.testConnection({ apiKey: '  ' }, 'google/gemini-2.5-flash')
+    assert.equal(result.success, false)
+    assert.ok(result.message.includes('missing'))
+  })
+
+  it('sends HTTP-Referer and X-Title headers and extracts choices', async () => {
+    let capturedHeaders: HeadersInit | undefined = undefined
+
+    globalThis.fetch = (async (_url: string, init?: RequestInit) => {
+      capturedHeaders = init?.headers
+      return {
+        ok: true,
+        status: 200,
+        headers: new Headers(),
+        json: async () => ({
+          choices: [
+            {
+              message: {
+                content: 'pong',
+                tool_calls: undefined
+              },
+              finish_reason: 'stop'
+            }
+          ]
+        })
+      } as Response
+    }) as typeof globalThis.fetch
+
+    const testRes = await provider.testConnection(
+      { apiKey: 'sk-or-v1-test' },
+      'anthropic/claude-3-opus'
+    )
+    assert.equal(testRes.success, true)
+    const headersRecord = capturedHeaders as Record<string, string>
+    assert.equal(headersRecord?.['HTTP-Referer'], 'https://github.com/birol-dev/Pexels')
+    assert.equal(headersRecord?.['X-Title'], 'AI Stock Asset Finder')
+    assert.equal(headersRecord?.Authorization, 'Bearer sk-or-v1-test')
+  })
+
+  it('uses max_tokens (not max_completion_tokens) in createToolTurn payload', async () => {
+    let capturedPayload: Record<string, unknown> | null = null
+
+    globalThis.fetch = (async (_url: string, init?: RequestInit) => {
+      capturedPayload = JSON.parse(init?.body as string) as Record<string, unknown>
+      return {
+        ok: true,
+        status: 200,
+        headers: new Headers(),
+        json: async () => ({
+          choices: [
+            {
+              message: { content: 'ok', tool_calls: undefined },
+              finish_reason: 'stop'
+            }
+          ]
+        })
+      } as Response
+    }) as typeof globalThis.fetch
+
+    await provider.createToolTurn(
+      {
+        model: 'google/gemini-2.5-flash',
+        systemPrompt: 'You are an assistant',
+        messages: [{ role: 'user', content: 'hi' }],
+        tools: sampleTools,
+        toolChoice: 'auto',
+        temperature: 0.2,
+        maxOutputTokens: 800
+      },
+      { apiKey: 'sk-or-v1-test' }
+    )
+
+    assert.equal(capturedPayload?.max_tokens, 800)
+    assert.equal(capturedPayload?.max_completion_tokens, undefined)
+    assert.equal(capturedPayload?.model, 'google/gemini-2.5-flash')
+    assert.deepEqual(capturedPayload?.cache_control, { type: 'ephemeral' })
+  })
+
+  it('pins OpenRouter sticky routing with session_id and prompt_cache_key', async () => {
+    let capturedPayload: Record<string, unknown> | null = null
+
+    globalThis.fetch = (async (_url: string, init?: RequestInit) => {
+      capturedPayload = JSON.parse(init?.body as string) as Record<string, unknown>
+      return {
+        ok: true,
+        status: 200,
+        headers: new Headers(),
+        json: async () => ({
+          choices: [
+            {
+              message: { content: 'ok', tool_calls: undefined },
+              finish_reason: 'stop'
+            }
+          ]
+        })
+      } as Response
+    }) as typeof globalThis.fetch
+
+    await provider.createToolTurn(
+      {
+        model: 'deepseek/deepseek-v4.1-flash:floor',
+        systemPrompt: 'You are StockScout',
+        messages: [{ role: 'user', content: 'search now' }],
+        tools: sampleTools,
+        toolChoice: 'auto',
+        temperature: 0.2,
+        maxOutputTokens: 800,
+        sessionId: `stockfinder:job_123`
+      },
+      { apiKey: 'sk-or-v1-test' }
+    )
+
+    assert.equal(capturedPayload?.session_id, 'stockfinder:job_123')
+    assert.equal(capturedPayload?.prompt_cache_key, 'stockfinder:job_123')
+    assert.deepEqual(capturedPayload?.cache_control, { type: 'ephemeral' })
+    const messages = capturedPayload?.messages as Array<{ role: string; content: string }>
+    assert.equal(messages?.[0]?.role, 'system')
+    assert.equal(messages?.[0]?.content, 'You are StockScout')
+    assert.equal(messages?.[1]?.content, 'search now')
+  })
+
+  it('sends OpenRouter reasoning config so DeepSeek does not burn max_tokens thinking', async () => {
+    let capturedPayload: Record<string, unknown> | null = null
+
+    globalThis.fetch = (async (_url: string, init?: RequestInit) => {
+      capturedPayload = JSON.parse(init?.body as string) as Record<string, unknown>
+      return {
+        ok: true,
+        status: 200,
+        headers: new Headers(),
+        json: async () => ({
+          choices: [
+            {
+              message: { content: '', tool_calls: [] },
+              finish_reason: 'stop'
+            }
+          ]
+        })
+      } as Response
+    }) as typeof globalThis.fetch
+
+    await provider.createToolTurn(
+      {
+        model: 'deepseek/deepseek-v4.1-flash:floor',
+        systemPrompt: 'Segment the script',
+        messages: [{ role: 'user', content: 'A dark hallway creaks.' }],
+        tools: sampleTools,
+        toolChoice: { name: 'search_pexels_photos' },
+        temperature: 0.2,
+        maxOutputTokens: LLM_STRUCTURED_MAX_OUTPUT_TOKENS,
+        reasoning: LLM_STRUCTURED_REASONING
+      },
+      { apiKey: 'sk-or-v1-test' }
+    )
+
+    assert.deepEqual(capturedPayload?.reasoning, { enabled: false, effort: 'low' })
+    assert.equal(capturedPayload?.max_tokens, LLM_STRUCTURED_MAX_OUTPUT_TOKENS)
+  })
+
+  it('treats finish_reason length plus reasoning_tokens as a truncated turn', async () => {
+    globalThis.fetch = (async () => {
+      return {
+        ok: true,
+        status: 200,
+        headers: new Headers(),
+        json: async () => ({
+          choices: [
+            {
+              message: { content: '', tool_calls: undefined },
+              finish_reason: 'length'
+            }
+          ],
+          usage: {
+            prompt_tokens: 200,
+            completion_tokens: 4000,
+            total_tokens: 4200,
+            completion_tokens_details: { reasoning_tokens: 4000 }
+          }
+        })
+      } as Response
+    }) as typeof globalThis.fetch
+
+    const result = await provider.createToolTurn(
+      {
+        model: 'deepseek/deepseek-v4.1-flash:floor',
+        systemPrompt: '',
+        messages: [{ role: 'user', content: 'segment this' }],
+        tools: sampleTools,
+        toolChoice: { name: 'search_pexels_photos' },
+        temperature: 0.2,
+        maxOutputTokens: 4000
+      },
+      { apiKey: 'sk-or-v1-test' }
+    )
+
+    assert.equal(result.stopReason, 'length')
+    assert.equal(result.toolCalls.length, 0)
+    assert.equal(result.assistantMessage.content, '')
+    assert.equal(result.usage?.outputTokens, 4000)
+    assert.equal(result.usage?.reasoningTokens, 4000)
+  })
+
+  it('accepts tool_calls that omit type=function', async () => {
+    globalThis.fetch = (async () => {
+      return {
+        ok: true,
+        status: 200,
+        headers: new Headers(),
+        json: async () => ({
+          choices: [
+            {
+              message: {
+                content: null,
+                tool_calls: [
+                  {
+                    id: 'call_1',
+                    function: { name: 'search_pexels_photos', arguments: '{"query":"fog"}' }
+                  }
+                ]
+              },
+              finish_reason: 'stop'
+            }
+          ]
+        })
+      } as Response
+    }) as typeof globalThis.fetch
+
+    const result = await provider.createToolTurn(
+      {
+        model: 'deepseek/deepseek-v4.1-flash:floor',
+        systemPrompt: '',
+        messages: [{ role: 'user', content: 'search' }],
+        tools: sampleTools,
+        toolChoice: 'auto',
+        temperature: 0.2,
+        maxOutputTokens: 800
+      },
+      { apiKey: 'sk-or-v1-test' }
+    )
+
+    assert.equal(result.toolCalls.length, 1)
+    assert.equal(result.toolCalls[0].name, 'search_pexels_photos')
+    assert.equal(result.stopReason, 'tool_calls')
+  })
+})
+
+describe('normalizeChatToolCalls', () => {
+  it('keeps function tool calls even when type is omitted', () => {
+    const calls = normalizeChatToolCalls([
+      { id: 'a', function: { name: 'submit_script_beats', arguments: '{"beats":[]}' } }
+    ])
+    assert.equal(calls.length, 1)
+    assert.equal(calls[0].name, 'submit_script_beats')
+  })
+})
+
+describe('toOpenRouterReasoningPayload', () => {
+  it('omits undefined keys', () => {
+    assert.deepEqual(toOpenRouterReasoningPayload({ effort: 'low' }), { effort: 'low' })
+    assert.deepEqual(toOpenRouterReasoningPayload(LLM_STRUCTURED_REASONING), {
+      enabled: false,
+      effort: 'low'
+    })
+  })
+})
+
+describe('LLM output budgets', () => {
+  it('uses the 32,768 completion budget documented for reasoning models', () => {
+    assert.equal(LLM_STRUCTURED_MAX_OUTPUT_TOKENS, 32768)
+  })
+})
+
+describe('GeminiProvider', () => {
+  const provider = LlmProviderFactory.getProvider('gemini')
+
+  it('rejects testConnection when API key is missing', async () => {
+    const result = await provider.testConnection({ apiKey: '' }, 'gemini-2.5-flash')
+    assert.equal(result.success, false)
+    assert.ok(result.message.includes('missing'))
+  })
+
+  it('formats schema types to uppercase, strips additionalProperties, and parses response', async () => {
+    let capturedPayload: Record<string, unknown> | null = null
+    let capturedUrl = ''
+    let capturedHeaders: HeadersInit | undefined
+
+    globalThis.fetch = (async (url: string, init?: RequestInit) => {
+      capturedUrl = url
+      capturedHeaders = init?.headers
+      capturedPayload = JSON.parse(init?.body as string) as Record<string, unknown>
+      return {
+        ok: true,
+        status: 200,
+        headers: new Headers(),
+        json: async () => ({
+          candidates: [
+            {
+              content: {
+                parts: [
+                  { text: 'Searching Pexels for nature' },
+                  {
+                    functionCall: {
+                      name: 'search_pexels_photos',
+                      args: { query: 'forest' }
+                    }
+                  }
+                ]
+              },
+              finishReason: 'STOP'
+            }
+          ],
+          usageMetadata: {
+            promptTokenCount: 50,
+            candidatesTokenCount: 20,
+            totalTokenCount: 70
+          }
+        })
+      } as Response
+    }) as typeof globalThis.fetch
+
+    const toolsWithExtras: NormalizedToolDefinition[] = [
+      {
+        name: 'search_pexels_photos',
+        description: 'Search for photos',
+        parameters: {
+          type: 'object',
+          properties: {
+            query: { type: 'string' }
+          },
+          required: ['query']
+        }
+      }
+    ]
+
+    const result = await provider.createToolTurn(
+      {
+        model: 'gemini-2.5-flash',
+        systemPrompt: 'You are StockScout',
+        messages: [{ role: 'user', content: 'Find a forest photo' }],
+        tools: toolsWithExtras,
+        toolChoice: 'auto',
+        temperature: 0.3,
+        maxOutputTokens: 1000
+      },
+      { apiKey: 'AIzaSyTestKey' }
+    )
+
+    assert.ok(capturedUrl.endsWith('models/gemini-2.5-flash:generateContent'))
+    assert.ok(!capturedUrl.includes('key='))
+    const headerMap = (capturedHeaders as Record<string, string>) || {}
+    assert.equal(headerMap['x-goog-api-key'], 'AIzaSyTestKey')
+    const sysInstruction = capturedPayload?.systemInstruction as { parts: Array<{ text: string }> }
+    assert.equal(sysInstruction?.parts?.[0]?.text, 'You are StockScout')
+
+    const tools = capturedPayload?.tools as Array<{
+      functionDeclarations: Array<{
+        parameters: {
+          type: string
+          properties: { query: { type: string } }
+          additionalProperties?: unknown
+        }
+      }>
+    }>
+    const functionDecl = tools?.[0]?.functionDeclarations?.[0]
+    assert.equal(functionDecl?.parameters?.type, 'OBJECT')
+    assert.equal(functionDecl?.parameters?.properties?.query?.type, 'STRING')
+    assert.equal(functionDecl?.parameters?.additionalProperties, undefined)
+
+    assert.equal(result.assistantMessage.content, 'Searching Pexels for nature')
+    assert.equal(result.toolCalls.length, 1)
+    assert.equal(result.toolCalls[0].name, 'search_pexels_photos')
+    assert.equal(result.toolCalls[0].arguments, '{"query":"forest"}')
+    assert.equal(result.usage?.totalTokens, 70)
+  })
+
+  it('surfaces safety blocked response clearly', async () => {
+    globalThis.fetch = (async () =>
+      ({
+        ok: true,
+        status: 200,
+        headers: new Headers(),
+        json: async () => ({
+          candidates: [
+            {
+              finishReason: 'SAFETY'
+            }
+          ]
+        })
+      }) as Response) as typeof globalThis.fetch
+
+    await assert.rejects(
+      () =>
+        provider.createToolTurn(
+          {
+            model: 'gemini-2.5-flash',
+            systemPrompt: '',
+            messages: [{ role: 'user', content: 'hello' }],
+            tools: [],
+            toolChoice: 'none',
+            temperature: 0.1,
+            maxOutputTokens: 10
+          },
+          { apiKey: 'AIzaSyTestKey' }
+        ),
+      /blocked due to safety settings/
+    )
+  })
+
+  it('preserves thought_signature and rawParts in multi-turn history', async () => {
+    let capturedPayload: Record<string, unknown> | null = null
+
+    globalThis.fetch = (async (_url: string, init?: RequestInit) => {
+      capturedPayload = JSON.parse(init?.body as string) as Record<string, unknown>
+      return {
+        ok: true,
+        status: 200,
+        headers: new Headers(),
+        json: async () => ({
+          candidates: [
+            {
+              content: {
+                parts: [{ text: 'Here are the results' }]
+              },
+              finishReason: 'STOP'
+            }
+          ]
+        })
+      } as Response
+    }) as typeof globalThis.fetch
+
+    const rawPartsWithSignature = [
+      { text: 'Thinking about query...', thought: true },
+      {
+        functionCall: {
+          name: 'search_pexels_videos',
+          args: { beatId: 'beat_1', query: 'futuristic server room' }
+        },
+        thought_signature: 'test_encrypted_signature_token_123'
+      }
+    ]
+
+    await provider.createToolTurn(
+      {
+        model: 'gemini-2.5-flash',
+        systemPrompt: 'You are StockScout',
+        messages: [
+          { role: 'user', content: 'Find stock clips' },
+          {
+            role: 'assistant',
+            content: 'Searching videos',
+            tool_calls: [
+              {
+                id: 'call_1',
+                name: 'search_pexels_videos',
+                arguments: '{"beatId":"beat_1","query":"futuristic server room"}'
+              }
+            ],
+            rawParts: rawPartsWithSignature
+          },
+          {
+            role: 'tool',
+            name: 'search_pexels_videos',
+            tool_call_id: 'call_1',
+            content: JSON.stringify({ results: [] })
+          }
+        ],
+        tools: sampleTools,
+        toolChoice: 'auto',
+        temperature: 0.3,
+        maxOutputTokens: 1000
+      },
+      { apiKey: 'AIzaSyTestKey' }
+    )
+
+    const contents = capturedPayload?.contents as Array<{
+      role: string
+      parts: Array<Record<string, unknown>>
+    }>
+    assert.equal(contents.length, 3)
+    assert.equal(contents[1].role, 'model')
+    assert.equal(contents[1].parts.length, 2)
+    assert.equal(contents[1].parts[1].thought_signature, 'test_encrypted_signature_token_123')
+  })
+
+  it('prefers API functionCall.id when present', async () => {
+    globalThis.fetch = (async () =>
+      ({
+        ok: true,
+        status: 200,
+        headers: new Headers(),
+        json: async () => ({
+          candidates: [
+            {
+              content: {
+                parts: [
+                  {
+                    functionCall: {
+                      id: 'api_call_42',
+                      name: 'search_pexels_photos',
+                      args: { query: 'ocean' }
+                    }
+                  }
+                ]
+              },
+              finishReason: 'STOP'
+            }
+          ]
+        })
+      }) as Response) as typeof globalThis.fetch
+
+    const result = await provider.createToolTurn(
+      {
+        model: 'gemini-3.8-flash',
+        systemPrompt: '',
+        messages: [{ role: 'user', content: 'Find ocean photos' }],
+        tools: sampleTools,
+        toolChoice: 'auto',
+        temperature: 0.2,
+        maxOutputTokens: 500
+      },
+      { apiKey: 'AIzaSyTestKey' }
+    )
+
+    assert.equal(result.toolCalls.length, 1)
+    assert.equal(result.toolCalls[0].id, 'api_call_42')
+    assert.equal(result.toolCalls[0].name, 'search_pexels_photos')
+  })
+
+  it('excludes thought-only parts from assistantMessage.content', async () => {
+    globalThis.fetch = (async () =>
+      ({
+        ok: true,
+        status: 200,
+        headers: new Headers(),
+        json: async () => ({
+          candidates: [
+            {
+              content: {
+                parts: [
+                  { text: 'Internal reasoning about the query', thought: true },
+                  { text: 'Here is a good ocean shot' },
+                  {
+                    functionCall: {
+                      name: 'search_pexels_photos',
+                      args: { query: 'ocean' }
+                    }
+                  }
+                ]
+              },
+              finishReason: 'STOP'
+            }
+          ]
+        })
+      }) as Response) as typeof globalThis.fetch
+
+    const result = await provider.createToolTurn(
+      {
+        model: 'gemini-3.8-flash',
+        systemPrompt: '',
+        messages: [{ role: 'user', content: 'Find ocean photos' }],
+        tools: sampleTools,
+        toolChoice: 'auto',
+        temperature: 0.2,
+        maxOutputTokens: 500
+      },
+      { apiKey: 'AIzaSyTestKey' }
+    )
+
+    assert.equal(result.assistantMessage.content, 'Here is a good ocean shot')
+    assert.ok(!result.assistantMessage.content?.includes('Internal reasoning'))
+    assert.equal(result.assistantMessage.rawParts?.length, 3)
+  })
+
+  it('includes functionResponse.id matching tool_call_id on follow-up', async () => {
+    let capturedPayload: Record<string, unknown> | null = null
+
+    globalThis.fetch = (async (_url: string, init?: RequestInit) => {
+      capturedPayload = JSON.parse(init?.body as string) as Record<string, unknown>
+      return {
+        ok: true,
+        status: 200,
+        headers: new Headers(),
+        json: async () => ({
+          candidates: [
+            {
+              content: { parts: [{ text: 'Done' }] },
+              finishReason: 'STOP'
+            }
+          ]
+        })
+      } as Response
+    }) as typeof globalThis.fetch
+
+    await provider.createToolTurn(
+      {
+        model: 'gemini-3.8-flash',
+        systemPrompt: 'You are StockScout',
+        messages: [
+          { role: 'user', content: 'Find stock clips' },
+          {
+            role: 'assistant',
+            content: null,
+            tool_calls: [
+              {
+                id: 'api_call_99',
+                name: 'search_pexels_photos',
+                arguments: '{"query":"forest"}'
+              }
+            ]
+          },
+          {
+            role: 'tool',
+            name: 'search_pexels_photos',
+            tool_call_id: 'api_call_99',
+            content: JSON.stringify({ results: [] })
+          }
+        ],
+        tools: sampleTools,
+        toolChoice: 'auto',
+        temperature: 0.3,
+        maxOutputTokens: 1000
+      },
+      { apiKey: 'AIzaSyTestKey' }
+    )
+
+    const contents = capturedPayload?.contents as Array<{
+      role: string
+      parts: Array<{ functionResponse?: { name: string; id?: string; response: unknown } }>
+    }>
+    const toolContent = contents.find((c) =>
+      c.parts.some((p) => p.functionResponse?.name === 'search_pexels_photos')
+    )
+    assert.ok(toolContent)
+    const fr = toolContent?.parts.find((p) => p.functionResponse)?.functionResponse
+    assert.equal(fr?.id, 'api_call_99')
+  })
+
+  it('strips $schema from tool parameters', async () => {
+    let capturedPayload: Record<string, unknown> | null = null
+
+    globalThis.fetch = (async (_url: string, init?: RequestInit) => {
+      capturedPayload = JSON.parse(init?.body as string) as Record<string, unknown>
+      return {
+        ok: true,
+        status: 200,
+        headers: new Headers(),
+        json: async () => ({
+          candidates: [{ content: { parts: [{ text: 'ok' }] }, finishReason: 'STOP' }]
+        })
+      } as Response
+    }) as typeof globalThis.fetch
+
+    const toolsWithSchema: NormalizedToolDefinition[] = [
+      {
+        name: 'search_pexels_photos',
+        description: 'Search',
+        parameters: {
+          type: 'object',
+          properties: { query: { type: 'string' } },
+          required: ['query'],
+          // @ts-expect-error intentional unsupported field for strip test
+          $schema: 'http://json-schema.org/draft-07/schema#'
+        }
+      }
+    ]
+
+    await provider.createToolTurn(
+      {
+        model: 'gemini-3.8-flash',
+        systemPrompt: '',
+        messages: [{ role: 'user', content: 'hi' }],
+        tools: toolsWithSchema,
+        toolChoice: 'auto',
+        temperature: 0.1,
+        maxOutputTokens: 50
+      },
+      { apiKey: 'AIzaSyTestKey' }
+    )
+
+    const tools = capturedPayload?.tools as Array<{
+      functionDeclarations: Array<{ parameters: Record<string, unknown> }>
+    }>
+    assert.equal(tools?.[0]?.functionDeclarations?.[0]?.parameters?.$schema, undefined)
+    assert.equal(tools?.[0]?.functionDeclarations?.[0]?.parameters?.type, 'OBJECT')
+  })
+})
+
+describe('CustomProvider', () => {
+  const provider = LlmProviderFactory.getProvider('custom')
+
+  const okResponse = (): Response =>
+    ({
+      ok: true,
+      status: 200,
+      headers: new Headers(),
+      json: async () => ({
+        choices: [{ message: { content: 'pong' }, finish_reason: 'stop' }]
+      })
+    }) as Response
+
+  it('is registered in the factory', () => {
+    assert.equal(provider.id, 'custom')
+  })
+
+  it('resolves the chat completions endpoint from a base URL', () => {
+    assert.equal(
+      resolveCustomChatCompletionsUrl('https://router.example/v1'),
+      'https://router.example/v1/chat/completions'
+    )
+    assert.equal(
+      resolveCustomChatCompletionsUrl('  https://router.example/v1/  '),
+      'https://router.example/v1/chat/completions'
+    )
+    assert.equal(
+      resolveCustomChatCompletionsUrl('https://router.example/v1/chat/completions'),
+      'https://router.example/v1/chat/completions'
+    )
+    assert.equal(
+      resolveCustomChatCompletionsUrl('http://localhost:11434/v1'),
+      'http://localhost:11434/v1/chat/completions'
+    )
+  })
+
+  it('rejects missing, malformed, and non-local plain HTTP base URLs', () => {
+    assert.throws(() => resolveCustomChatCompletionsUrl(''), /base URL is missing/)
+    assert.throws(() => resolveCustomChatCompletionsUrl(undefined), /base URL is missing/)
+    assert.throws(() => resolveCustomChatCompletionsUrl('router.example/v1'), /not a valid URL/)
+    assert.throws(() => resolveCustomChatCompletionsUrl('http://router.example/v1'), /HTTPS/)
+    assert.throws(() => resolveCustomChatCompletionsUrl('file:///etc/passwd'), /HTTPS/)
+  })
+
+  it('sends the request to the configured base URL with a bearer key and max_tokens', async () => {
+    let capturedUrl = ''
+    let capturedHeaders: HeadersInit | undefined = undefined
+    let capturedPayload: Record<string, unknown> | null = null
+
+    globalThis.fetch = (async (url: string, init?: RequestInit) => {
+      capturedUrl = url
+      capturedHeaders = init?.headers
+      capturedPayload = JSON.parse(init?.body as string) as Record<string, unknown>
+      return {
+        ok: true,
+        status: 200,
+        headers: new Headers(),
+        json: async () => ({
+          choices: [
+            {
+              message: {
+                content: null,
+                tool_calls: [
+                  {
+                    id: 'call_1',
+                    type: 'function',
+                    function: { name: 'search_pexels_photos', arguments: '{"query":"ocean"}' }
+                  }
+                ]
+              },
+              finish_reason: 'tool_calls'
+            }
+          ]
+        })
+      } as Response
+    }) as typeof globalThis.fetch
+
+    const result = await provider.createToolTurn(
+      {
+        model: 'some/model',
+        systemPrompt: 'system',
+        messages: [{ role: 'user', content: 'hi' }],
+        tools: sampleTools,
+        toolChoice: { name: 'search_pexels_photos' },
+        temperature: 0.2,
+        maxOutputTokens: 100
+      },
+      { apiKey: ' sk-custom ', baseUrl: 'https://router.example/v1/' }
+    )
+
+    assert.equal(capturedUrl, 'https://router.example/v1/chat/completions')
+    assert.equal((capturedHeaders as Record<string, string>).Authorization, 'Bearer sk-custom')
+    const payload = capturedPayload as unknown as Record<string, unknown>
+    assert.equal(payload.model, 'some/model')
+    assert.equal(payload.max_tokens, 100)
+    assert.equal('max_completion_tokens' in payload, false)
+    assert.deepEqual(payload.tool_choice, {
+      type: 'function',
+      function: { name: 'search_pexels_photos' }
+    })
+    assert.equal(result.stopReason, 'tool_calls')
+    assert.equal(result.toolCalls[0].name, 'search_pexels_photos')
+  })
+
+  it('passes the base URL through testConnection', async () => {
+    let capturedUrl = ''
+    globalThis.fetch = (async (url: string) => {
+      capturedUrl = url
+      return okResponse()
+    }) as typeof globalThis.fetch
+
+    const result = await provider.testConnection(
+      { apiKey: 'sk-custom', baseUrl: 'https://router.example/v1' },
+      'some/model'
+    )
+    assert.equal(result.success, true)
+    assert.equal(capturedUrl, 'https://router.example/v1/chat/completions')
+  })
+
+  it('fails testConnection without calling the network when base URL or model is missing', async () => {
+    let called = false
+    globalThis.fetch = (async () => {
+      called = true
+      return okResponse()
+    }) as typeof globalThis.fetch
+
+    const noUrl = await provider.testConnection({ apiKey: 'sk-custom' }, 'some/model')
+    assert.equal(noUrl.success, false)
+    assert.match(noUrl.message, /base URL is missing/)
+
+    const noModel = await provider.testConnection(
+      { apiKey: 'sk-custom', baseUrl: 'https://router.example/v1' },
+      ''
+    )
+    assert.equal(noModel.success, false)
+    assert.match(noModel.message, /model ID is missing/)
+
+    const noKey = await provider.testConnection(
+      { apiKey: '', baseUrl: 'https://router.example/v1' },
+      'some/model'
+    )
+    assert.equal(noKey.success, false)
+    assert.equal(called, false)
+  })
+})
